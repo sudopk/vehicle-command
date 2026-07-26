@@ -1,4 +1,4 @@
-// Package ble implements the vehicle.Connector interface using BLE.
+// Package ble implements the vehicle.Connector interface using BLE via tinygo.org/x/bluetooth.
 
 package ble
 
@@ -10,14 +10,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-ble/ble"
 	"github.com/teslamotors/vehicle-command/internal/log"
 	"github.com/teslamotors/vehicle-command/pkg/connector"
 	"github.com/teslamotors/vehicle-command/pkg/protocol"
+	"tinygo.org/x/bluetooth"
 )
 
 const (
-	maxBLEMTUSize     = ble.MaxMTU // Max MTU size accepted by the client (this library)
+	// https://github.com/go-ble/ble/blob/8c5522f543335a80e18fc70e704b104cf3fcc606/const.go#L8
+	defaultBLEMTU     = 515
 	maxBLEMessageSize = 1024
 )
 
@@ -25,29 +26,37 @@ var ErrAdapterInvalidID = protocol.NewError("the bluetooth adapter ID is invalid
 var ErrMaxConnectionsExceeded = protocol.NewError("the vehicle is already connected to the maximum number of BLE devices", false, false)
 
 var (
-	rxTimeout  = time.Second     // Timeout interval between receiving chunks of a mesasge
+	rxTimeout  = time.Second     // Timeout interval between receiving chunks of a message
 	maxLatency = 4 * time.Second // Max allowed error when syncing vehicle clock
 )
 
 var (
-	vehicleServiceUUID = ble.MustParse("00000211-b2d1-43f0-9b88-960cebf8b91e")
-	toVehicleUUID      = ble.MustParse("00000212-b2d1-43f0-9b88-960cebf8b91e")
-	fromVehicleUUID    = ble.MustParse("00000213-b2d1-43f0-9b88-960cebf8b91e")
+	vehicleServiceUUID bluetooth.UUID
+	toVehicleUUID      bluetooth.UUID
+	fromVehicleUUID    bluetooth.UUID
 )
 
+func init() {
+	vehicleServiceUUID, _ = bluetooth.ParseUUID("00000211-b2d1-43f0-9b88-960cebf8b91e")
+	toVehicleUUID, _      = bluetooth.ParseUUID("00000212-b2d1-43f0-9b88-960cebf8b91e")
+	fromVehicleUUID, _    = bluetooth.ParseUUID("00000213-b2d1-43f0-9b88-960cebf8b91e")
+}
+
+
+
 var (
-	device ble.Device
-	mu     sync.Mutex
+	adapter *bluetooth.Adapter
+	mu      sync.Mutex
 )
 
 type Connection struct {
 	vin         string
 	inbox       chan []byte
-	txChar      *ble.Characteristic
+	txChar      bluetooth.DeviceCharacteristic
 	blockLength int
-	rxChar      *ble.Characteristic
+	rxChar      bluetooth.DeviceCharacteristic
 	inputBuffer []byte
-	client      ble.Client
+	device      *bluetooth.Device
 	lastRx      time.Time
 	lock        sync.Mutex
 }
@@ -87,8 +96,12 @@ func (c *Connection) flush() bool {
 }
 
 func (c *Connection) Close() {
-	_ = c.client.ClearSubscriptions()
-	_ = c.client.CancelConnection()
+	if c.rxChar.UUID() != (bluetooth.UUID{}) {
+		_ = c.rxChar.EnableNotifications(nil)
+	}
+	if c.device != nil {
+		_ = c.device.Disconnect()
+	}
 }
 
 func (c *Connection) AllowedLatency() time.Duration {
@@ -118,8 +131,10 @@ func (c *Connection) Send(_ context.Context, buffer []byte) error {
 		if blockLength > len(out) {
 			blockLength = len(out)
 		}
-		if err := c.client.WriteCharacteristic(c.txChar, out[:blockLength], false); err != nil {
-			return err
+		if _, err := c.txChar.WriteWithoutResponse(out[:blockLength]); err != nil {
+			if _, err := c.txChar.Write(out[:blockLength]); err != nil {
+				return err
+			}
 		}
 		out = out[blockLength:]
 	}
@@ -137,47 +152,35 @@ func VehicleLocalName(vin string) string {
 }
 
 // InitAdapterWithID initializes the BLE adapter with the given ID.
-// Currently this is only supported on Linux. It is not necessary to
-// call this function if using the default adapter, but if not, it
-// must be called before making any other BLE calls.
-// Linux:
-//   - id is in the form "hciX" where X is the number of the adapter.
 func InitAdapterWithID(id string) error {
 	mu.Lock()
 	defer mu.Unlock()
 	return initAdapter(&id)
 }
 
-// CloseAdapter unsets the BLE adapter so that a new one can be created
-// on the next call to InitAdapter. This does not disconnect any existing
-// connections or stop any ongoing scans and must be done separately.
+// CloseAdapter unsets the BLE adapter.
 func CloseAdapter() error {
 	mu.Lock()
 	defer mu.Unlock()
-	if device != nil {
-		if err := device.Stop(); err != nil {
-			return fmt.Errorf("ble: failed to stop device: %s", err)
-		}
-		device = nil
+	if adapter != nil {
+		_ = adapter.StopScan()
+		adapter = nil
 		log.Debug("Closed BLE adapter")
 	}
 	return nil
 }
 
 func initAdapter(id *string) error {
-	var err error
-	// We don't want concurrent calls to NewConnection that would defeat
-	// the point of reusing the existing BLE device. Note that this is not
-	// an issue on MacOS, but multiple calls to newDevice() on Linux leads to failures.
-	if device != nil {
+	if adapter != nil {
 		log.Debug("Reusing existing BLE device")
-	} else {
-		log.Debug("Creating new BLE adapter")
-		device, err = newAdapter(id)
-		if err != nil {
-			return fmt.Errorf("ble: failed to enable device: %s", err)
-		}
+		return nil
 	}
+	log.Debug("Creating new BLE adapter")
+	ad, err := newAdapter(id)
+	if err != nil {
+		return fmt.Errorf("ble: failed to enable device: %s", err)
+	}
+	adapter = ad
 	return nil
 }
 
@@ -186,15 +189,6 @@ type ScanResult struct {
 	LocalName   string
 	RSSI        int16
 	Connectable bool
-}
-
-func advertisementToScanResult(a ble.Advertisement) *ScanResult {
-	return &ScanResult{
-		Address:     a.Addr().String(),
-		LocalName:   a.LocalName(),
-		RSSI:        int16(a.RSSI()),
-		Connectable: a.Connectable(),
-	}
 }
 
 func ScanVehicleBeacon(ctx context.Context, vin string) (*ScanResult, error) {
@@ -213,49 +207,66 @@ func ScanVehicleBeacon(ctx context.Context, vin string) (*ScanResult, error) {
 }
 
 func scanVehicleBeacon(ctx context.Context, localName string) (*ScanResult, error) {
-	var err error
 	ctx2, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	ch := make(chan ble.Advertisement, 1)
-	fn := func(a ble.Advertisement) {
-		if a.LocalName() != localName {
-			return
-		}
-		select {
-		case ch <- a:
-			cancel() // Notify device.Scan() that we found a match
-		case <-ctx2.Done():
-			// Another goroutine already found a matching advertisement. We need to return so that
-			// the MacOS implementation of device.Scan(...) unblocks.
-		}
-	}
+	ch := make(chan *ScanResult, 1)
 
-	if err = device.Scan(ctx2, false, fn); !errors.Is(err, context.Canceled) {
-		// If ctx rather than ctx2 was canceled, we'll pick that error up below. This is a bit
-		// hacky, but unfortunately device.Scan() _always_ returns an error on MacOS because it does
-		// not terminate until the provided context is canceled.
-		return nil, err
-	}
+	// Launch a watcher goroutine to call adapter.StopScan() when ctx is canceled or target is found.
+	// adapter.Scan() is blocking, so StopScan() must be called asynchronously to unblock it.
+	stopWatcher := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx2.Done():
+			if adapter != nil {
+				_ = adapter.StopScan()
+			}
+		case <-stopWatcher:
+		}
+	}()
+	defer close(stopWatcher)
+
+	err := adapter.Scan(func(_ *bluetooth.Adapter, result bluetooth.ScanResult) {
+		if result.LocalName() == localName {
+			res := &ScanResult{
+				Address:     result.Address.String(),
+				LocalName:   result.LocalName(),
+				RSSI:        int16(result.RSSI),
+				Connectable: true,
+			}
+			select {
+			case ch <- res:
+				cancel() // Triggers watcher to call StopScan() and unblock adapter.Scan()
+			case <-ctx2.Done():
+			}
+		}
+	})
 
 	select {
-	case a, ok := <-ch:
-		if !ok {
-			// This should never happen, but just in case
-			return nil, fmt.Errorf("scan channel closed")
+	case res := <-ch:
+		return res, nil
+	default:
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		return advertisementToScanResult(a), nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return nil, err
+		}
+		select {
+		case res := <-ch:
+			return res, nil
+		default:
+			return nil, fmt.Errorf("scan ended without finding vehicle")
+		}
 	}
 }
+
 
 func NewConnection(ctx context.Context, vin string) (*Connection, error) {
 	return NewConnectionFromScanResult(ctx, vin, nil)
 }
 
 // NewConnectionFromScanResult creates a new BLE connection to the given target.
-// If target is nil, the vehicle will be scanned for.
 func NewConnectionFromScanResult(ctx context.Context, vin string, target *ScanResult) (*Connection, error) {
 	var lastError error
 	for {
@@ -303,58 +314,55 @@ func tryToConnect(ctx context.Context, vin string, target *ScanResult) (*Connect
 		return nil, false, ErrMaxConnectionsExceeded
 	}
 
-	log.Debug("Dialing to %s (%s)...", target.Address, localName)
+	mac, err := bluetooth.ParseMAC(target.Address)
+	if err != nil {
+		return nil, false, fmt.Errorf("ble: invalid address %s: %s", target.Address, err)
+	}
 
-	client, err := device.Dial(ctx, ble.NewAddr(target.Address))
+	log.Debug("Dialing to %s (%s)...", target.Address, localName)
+	device, err := adapter.Connect(bluetooth.Address{MACAddress: bluetooth.MACAddress{MAC: mac}}, bluetooth.ConnectionParams{})
 	if err != nil {
 		return nil, true, fmt.Errorf("ble: failed to dial for %s (%s): %s", vin, localName, err)
 	}
 
-	log.Debug("Discovering services %s...", client.Addr())
-	services, err := client.DiscoverServices([]ble.UUID{vehicleServiceUUID})
-	if err != nil {
-		return nil, true, fmt.Errorf("ble: failed to enumerate device services: %s", err)
-	}
-	if len(services) == 0 {
-		return nil, true, fmt.Errorf("ble: failed to discover service")
+	log.Debug("Discovering services %s...", target.Address)
+	services, err := device.DiscoverServices([]bluetooth.UUID{vehicleServiceUUID})
+	if err != nil || len(services) == 0 {
+		_ = device.Disconnect()
+		return nil, true, fmt.Errorf("ble: failed to discover service: %v", err)
 	}
 
-	characteristics, err := client.DiscoverCharacteristics([]ble.UUID{toVehicleUUID, fromVehicleUUID}, services[0])
+	characteristics, err := services[0].DiscoverCharacteristics([]bluetooth.UUID{toVehicleUUID, fromVehicleUUID})
 	if err != nil {
+		_ = device.Disconnect()
 		return nil, true, fmt.Errorf("ble: failed to discover service characteristics: %s", err)
 	}
 
 	conn := Connection{
 		vin:    vin,
-		client: client,
+		device: &device,
 		inbox:  make(chan []byte, 5),
 	}
-	for _, characteristic := range characteristics {
-		if characteristic.UUID.Equal(toVehicleUUID) {
-			conn.txChar = characteristic
-		} else if characteristic.UUID.Equal(fromVehicleUUID) {
-			conn.rxChar = characteristic
-		}
-		if _, err := client.DiscoverDescriptors(nil, characteristic); err != nil {
-			return nil, true, fmt.Errorf("ble: couldn't fetch descriptors: %s", err)
+
+	for _, char := range characteristics {
+		if char.UUID() == toVehicleUUID {
+			conn.txChar = char
+		} else if char.UUID() == fromVehicleUUID {
+			conn.rxChar = char
 		}
 	}
-	if conn.txChar == nil || conn.rxChar == nil {
+
+	if conn.txChar.UUID() == (bluetooth.UUID{}) || conn.rxChar.UUID() == (bluetooth.UUID{}) {
+		_ = device.Disconnect()
 		return nil, true, fmt.Errorf("ble: failed to find required characteristics")
 	}
-	if err := client.Subscribe(conn.rxChar, true, conn.rx); err != nil {
+
+	if err := conn.rxChar.EnableNotifications(conn.rx); err != nil {
+		_ = device.Disconnect()
 		return nil, true, fmt.Errorf("ble: failed to subscribe to RX: %s", err)
 	}
 
-	txMtu, err := client.ExchangeMTU(maxBLEMTUSize)
-	if err != nil {
-		log.Warning("ble: failed to exchange MTU: %s", err)
-		conn.blockLength = ble.DefaultMTU - 3 // Fallback to default MTU size
-	} else {
-		conn.blockLength = min(txMtu, maxBLEMessageSize) - 3 // 3 bytes for header
-		log.Debug("MTU size: %d", txMtu)
-	}
-
+	conn.blockLength = defaultBLEMTU - 3 // 3 bytes header
 	log.Info("Connected to vehicle BLE")
 	return &conn, false, nil
 }

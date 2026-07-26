@@ -1,61 +1,42 @@
 package ble
 
 import (
-	"os"
-	"strconv"
+	"fmt"
 	"strings"
-	"time"
 
-	"github.com/go-ble/ble"
-	"github.com/go-ble/ble/linux"
-	"github.com/go-ble/ble/linux/hci/cmd"
+	"tinygo.org/x/bluetooth"
 )
 
 func IsAdapterError(err error) bool {
-	return strings.Contains(err.Error(), "operation not permitted")
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "bluetooth") ||
+		strings.Contains(errStr, "bluez") ||
+		strings.Contains(errStr, "adapter") ||
+		strings.Contains(errStr, "operation not permitted")
 }
 
 func AdapterErrorHelpMessage(err error) string {
-	// The underlying BLE package calls HCIDEVDOWN on the BLE device, presumably as a
-	// heavy-handed way of dealing with devices that are in a bad state.
-	return "Failed to initialize BLE adapter: \n\t" + err.Error() + "\n" +
-		"Try again after granting this application CAP_NET_ADMIN or running with root:\n\n" +
-		"\tsudo setcap 'cap_net_admin=eip' \"$(which " + os.Args[0] + ")\""
+	return "Failed to initialize BlueZ BLE adapter: \n\t" + err.Error() + "\n" +
+		"Please ensure bluetoothd is running and your user has access to Bluetooth.\n"
 }
 
-const bleTimeout = 20 * time.Second
-
-// TODO: Depending on the model and state, BLE advertisements come every 20ms or every 150ms.
-
-var scanParams = cmd.LESetScanParameters{
-	LEScanType:           1,    // Active scanning
-	LEScanInterval:       0x10, // 10ms
-	LEScanWindow:         0x10, // 10ms
-	OwnAddressType:       0,    // Static
-	ScanningFilterPolicy: 2,    // Basic filtered
-}
-
-func newAdapter(id *string) (ble.Device, error) {
-	opts := []ble.Option{
-		ble.OptDialerTimeout(bleTimeout),
-		ble.OptListenerTimeout(bleTimeout),
-		ble.OptScanParams(scanParams),
-	}
+func newAdapter(id *string) (*bluetooth.Adapter, error) {
+	var ad *bluetooth.Adapter
 	if id != nil && *id != "" {
 		if !strings.HasPrefix(*id, "hci") {
 			return nil, ErrAdapterInvalidID
 		}
-		hciStr := strings.TrimPrefix(*id, "hci")
-		hciID, err := strconv.Atoi(hciStr)
-		if err != nil || hciID < 0 || hciID > 15 {
-			return nil, ErrAdapterInvalidID
-		}
-		opts = append(opts, ble.OptDeviceID(hciID))
+		ad = bluetooth.NewAdapter(*id)
+	} else {
+		ad = bluetooth.DefaultAdapter
 	}
 
-	device, err := linux.NewDeviceWithName("vehicle-command", opts...)
-	if err != nil {
-		return nil, err
+	if err := ad.Enable(); err != nil {
+		return nil, fmt.Errorf("ble: failed to enable BlueZ adapter: %w", err)
 	}
-	return device, nil
+
+	return ad, nil
 }

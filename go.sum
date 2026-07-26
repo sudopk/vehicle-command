@@ -78,3 +78,5 @@ gopkg.in/check.v1 v1.0.0-20200902074654-038fdea0a05b/go.mod h1:Co6ibVJAznAaIkqp8
 gopkg.in/yaml.v2 v2.2.2/go.mod h1:hI93XBmqTisBFMUTm0b8Fm+jr3Dg1NNxqwp+5A1VGuI=
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
 gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+tinygo.org/x/bluetooth v0.15.0 h1:hLn8+iZFXvVxBzPIdZfvc6TD8JP32ixF22lCEWHAbIo=
+tinygo.org/x/bluetooth v0.15.0/go.mod h1:meayNB+9rC1igTUNmNU7KftlSEzrFHe37rBSQZjHN8Y=

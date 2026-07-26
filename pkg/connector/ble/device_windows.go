@@ -1,13 +1,12 @@
 package ble
 
 import (
-	"errors"
+	"fmt"
 
-	"github.com/go-ble/ble"
+	"tinygo.org/x/bluetooth"
 )
 
 func IsAdapterError(_ error) bool {
-	// TODO: Add check for Windows
 	return false
 }
 
@@ -15,6 +14,10 @@ func AdapterErrorHelpMessage(err error) string {
 	return err.Error()
 }
 
-func newAdapter(_ *string) (ble.Device, error) {
-	return nil, errors.New("not supported on Windows")
+func newAdapter(id *string) (*bluetooth.Adapter, error) {
+	ad := bluetooth.DefaultAdapter
+	if err := ad.Enable(); err != nil {
+		return nil, fmt.Errorf("ble: failed to enable adapter: %w", err)
+	}
+	return ad, nil
 }
