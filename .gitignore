@@ -11,3 +11,5 @@ examples/ble/ble
 *.DS_Store
 *.key
 config
+/ble
+/tesla-control
